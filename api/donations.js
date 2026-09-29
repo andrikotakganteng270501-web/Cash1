@@ -19,6 +19,32 @@ async function redisCommand(args) {
   return data.result;
 }
 
+function normalize(d) {
+  if (!d || typeof d !== "object") return null;
+
+  let ts = Number(d.timestamp);
+  if (!ts || !isFinite(ts)) ts = Math.floor(Date.now() / 1000);
+  if (ts > 1e12) ts = Math.floor(ts / 1000);
+
+  let amount = d.amount;
+  if (typeof amount !== "number") {
+    amount = Number(String(amount ?? "").replace(/[^\d]/g, ""));
+  }
+  if (!amount || !isFinite(amount) || amount <= 0) return null;
+
+  const name = String(d.name || d.donator_name || d.donor_name || "Anonymous");
+  const id = String(d.id || `${name}_${ts}_${amount}`);
+
+  return {
+    id,
+    name,
+    amount,
+    message: String(d.message ?? d.note ?? ""),
+    timestamp: ts,
+    userId: d.userId ? Number(d.userId) : undefined,
+  };
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -28,13 +54,12 @@ module.exports = async function handler(req, res) {
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed" });
 
-  const since = parseInt(req.query.since || "0", 10);
+  const since = parseInt(req.query.since || "0", 10) || 0;
 
   try {
     const raw = await redisCommand(["LRANGE", "donations", "0", "499"]);
 
     if (!raw || raw.length === 0) {
-      console.log(`[Donations] Redis kosong`);
       return res.status(200).json({
         donations:  [],
         total:      0,
@@ -42,28 +67,26 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const allDonations = raw.map(item => {
+    const entries = [];
+    for (const item of raw) {
+      let obj = item;
       if (typeof item === "string") {
-        try { return JSON.parse(item); } catch { return null; }
+        try { obj = JSON.parse(item); } catch { obj = null; }
       }
-      return item;
-    }).filter(Boolean);
-
-    const newDonations = allDonations.filter(d => d.timestamp > since);
-
-    newDonations.sort((a, b) => a.timestamp - b.timestamp);
-
-    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
-    const fresh = allDonations.filter(d => d.timestamp >= oneHourAgo);
-    if (fresh.length < allDonations.length) {
-      await redisCommand(["DEL", "donations"]);
-      for (const d of fresh.reverse()) {
-        await redisCommand(["RPUSH", "donations", JSON.stringify(d)]);
-      }
-      console.log(`[Donations] Cleaned ${allDonations.length - fresh.length} expired`);
+      const d = normalize(obj);
+      if (d) entries.push({ raw: item, d });
     }
 
-    console.log(`[Donations] since=${since} → ${newDonations.length}/${allDonations.length} dikirim ke Roblox`);
+    const newDonations = entries
+      .map(e => e.d)
+      .filter(d => d.timestamp > since)
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    const expired = entries.filter(e => e.d.timestamp < oneHourAgo && typeof e.raw === "string");
+    for (const e of expired) {
+      try { await redisCommand(["LREM", "donations", "0", e.raw]); } catch {}
+    }
 
     return res.status(200).json({
       donations:  newDonations,
@@ -72,7 +95,6 @@ module.exports = async function handler(req, res) {
     });
 
   } catch (err) {
-    console.error("[Donations] Redis Error:", err.message);
     return res.status(200).json({
       donations:  [],
       total:      0,
